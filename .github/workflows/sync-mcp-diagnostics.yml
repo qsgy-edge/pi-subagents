@@ -1,0 +1,104 @@
+name: Sync MCP diagnostics branch
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sync-mcp-diagnostics
+
+jobs:
+  verify:
+    if: github.repository == 'qsgy-edge/pi-subagents' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      candidate: ${{ steps.merge.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: mcp-readiness-diagnostics
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Merge upstream without rewriting the tracked branch
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/nicobailon/pi-subagents.git refs/heads/main
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            exit 0
+          fi
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' merge --no-edit FETCH_HEAD
+          echo "candidate=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v5
+        if: steps.merge.outputs.candidate != '' || github.event_name == 'workflow_dispatch'
+        with:
+          node-version: 24
+      - name: Verify diagnostic retention and native MCP startup
+        if: steps.merge.outputs.candidate != '' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          NODE_DISABLE_COMPILE_CACHE: '1'
+        run: |
+          set -euo pipefail
+          git grep -qF 'MCP readiness diagnostics:' HEAD -- src/runs/shared/child-session.ts
+          npm ci --ignore-scripts
+          npm run typecheck
+          npm install --prefix "$RUNNER_TEMP/native-pi" --no-package-lock --ignore-scripts @earendil-works/pi-coding-agent@1.6.0
+          export PI_SUBAGENTS_NATIVE_PI_ROOT="$(cygpath -m "$RUNNER_TEMP/native-pi")/node_modules/@earendil-works/pi-coding-agent"
+          loader=$(node -p 'require("node:url").pathToFileURL("test/support/native-peer-loader.mjs").href')
+          export NODE_OPTIONS="--import=$loader"
+          node --experimental-strip-types --import ./test/support/register-loader.mjs --test test/integration/in-process-child.test.ts test/integration/builtin-mcp-readiness.test.ts test/unit/child-session-scoped-dispose.test.ts
+      - name: Bundle verified candidate
+        if: steps.merge.outputs.candidate != ''
+        shell: bash
+        env:
+          CANDIDATE: ${{ steps.merge.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE"
+          git update-ref refs/heads/sync-candidate "$CANDIDATE"
+          git bundle create "$RUNNER_TEMP/candidate.bundle" refs/heads/sync-candidate --not refs/remotes/origin/mcp-readiness-diagnostics
+      - uses: actions/upload-artifact@v4
+        if: steps.merge.outputs.candidate != ''
+        with:
+          name: sync-candidate
+          path: ${{ runner.temp }}/candidate.bundle
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: verify
+    if: needs.verify.outputs.candidate != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sync-candidate
+          path: ${{ runner.temp }}/verified
+      - name: Advance only the diagnostics branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ needs.verify.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          git init --bare "$RUNNER_TEMP/publish.git"
+          cd "$RUNNER_TEMP/publish.git"
+          git remote add origin https://github.com/qsgy-edge/pi-subagents.git
+          git fetch --no-tags origin refs/heads/mcp-readiness-diagnostics
+          previous=$(git rev-parse FETCH_HEAD)
+          git fetch "$RUNNER_TEMP/verified/candidate.bundle" refs/heads/sync-candidate:refs/heads/sync-candidate
+          test "$(git rev-parse refs/heads/sync-candidate)" = "$CANDIDATE"
+          git merge-base --is-ancestor "$previous" "$CANDIDATE"
+          gh auth setup-git --hostname github.com
+          git push origin refs/heads/sync-candidate:refs/heads/mcp-readiness-diagnostics
