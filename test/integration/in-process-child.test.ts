@@ -779,7 +779,7 @@ describe("default child session factory", () => {
 });
 
 /** MCP connects after session_start. Its tool_call hook waits for the connection, not a separate registration timer. */
-function builtinMcpPi(tools = [["mcp__srv__echo", "srv/echo"], ["mcp__srv__add", "srv/add"]], connect?: Promise<void>) {
+function builtinMcpPi(tools = [["mcp__srv__echo", "srv/echo"], ["mcp__srv__add", "srv/add"]], connect?: Promise<void>, inactiveTools: string[] = []) {
 	type Tool = { name: string; label?: string; exposure: string; reachesTools?: () => string[] };
 	type Handler = (event: { toolName?: string }, ctx: { signal?: AbortSignal }) => unknown;
 	const registry = new Map<string, string>();
@@ -789,7 +789,7 @@ function builtinMcpPi(tools = [["mcp__srv__echo", "srv/echo"], ["mcp__srv__add",
 	const lifecycle: string[] = [];
 	let allowlist: string[] = [];
 	const getAllTools = () => [...definitions.values()].filter(({ name }) => allowlist.includes(name));
-	const pi = stubPi({ bindExtensions: async () => { for (const handler of handlers.get("session_start") ?? []) await handler({}, {}); }, extensionRunner: { hasHandlers: () => true, emit: async () => { lifecycle.push("session_shutdown"); } }, dispose: () => { lifecycle.push("dispose"); }, getAllTools, getActiveToolNames: () => getAllTools().filter(({ exposure }) => exposure === "direct").map(({ name }) => name) });
+	const pi = stubPi({ bindExtensions: async () => { for (const handler of handlers.get("session_start") ?? []) await handler({}, {}); }, extensionRunner: { hasHandlers: () => true, emit: async () => { lifecycle.push("session_shutdown"); } }, dispose: () => { lifecycle.push("dispose"); }, getAllTools, getActiveToolNames: () => getAllTools().filter(({ name, exposure }) => exposure === "direct" && !inactiveTools.includes(name)).map(({ name }) => name) });
 	Object.assign(pi, {
 		createCodemodeExtension: () => (api: { registerTool(tool: Tool): void }) => api.registerTool({ name: "codemode", exposure: "codemode", reachesTools: () => ["mcp__srv"] }),
 		createMcpExtension: () => (api: { registerTool(tool: Tool): void; on(type: string, handler: Handler): void; getAllTools(): Tool[] }) => {
@@ -863,6 +863,31 @@ describe("selected built-in MCP tools in a child session", () => {
 		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => mcp.pi });
 		await assert.rejects(factory.create({ ...stubLaunch, tools: ["mcp__srv__a_b"], builtinMcpTools: [{ name: "mcp__srv__a_b", selector: "srv/a.b" }] }), /did not register in the child session: mcp__srv__a_b\./);
 		assert.deepEqual([...mcp.registry], [["mcp__srv__a_b", "hidden"]]);
+	});
+
+	it("reports registration, exposure and active state for only the failing selections", async () => {
+		const mcp = builtinMcpPi([
+			["mcp__srv__echo", "srv/echo"],
+			["mcp__srv__hidden", "srv/other"],
+			["mcp__srv__inactive", "srv/inactive"],
+		], undefined, ["mcp__srv__inactive"]);
+		const builtinMcpTools = [
+			...mcpLaunch.builtinMcpTools!,
+			{ name: "mcp__srv__missing", selector: "srv/missing" },
+			{ name: "mcp__srv__hidden", selector: "srv/hidden" },
+			{ name: "mcp__srv__inactive", selector: "srv/inactive" },
+		];
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => mcp.pi });
+		await assert.rejects(factory.create({ ...mcpLaunch, tools: builtinMcpTools.map(({ name }) => name), builtinMcpTools }), (error: Error) => {
+			const diagnosticsLine = error.message.split("\n").find((line) => line.startsWith("MCP readiness diagnostics: "));
+			assert.ok(diagnosticsLine, "the startup error must include the readiness snapshot");
+			assert.deepEqual(JSON.parse(diagnosticsLine.slice("MCP readiness diagnostics: ".length)), [
+				{ name: "mcp__srv__missing", selector: "srv/missing", registered: false, exposure: null, active: false },
+				{ name: "mcp__srv__hidden", selector: "srv/hidden", registered: true, exposure: "hidden", active: false },
+				{ name: "mcp__srv__inactive", selector: "srv/inactive", registered: true, exposure: "direct", active: false },
+			]);
+			return true;
+		});
 	});
 
 	it("does not hold other child launches while it waits for MCP tools", async () => {

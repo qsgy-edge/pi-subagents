@@ -366,10 +366,14 @@ function selectedBuiltinMcpExtension(pi: PiCodingAgentModule, selections: Readon
 }
 
 /** Verify the declaration and callable exposure after Pi finishes the selected connection attempts. */
-function missingBuiltinMcpTools(session: { getAllTools(): Array<{ name: string }>; getActiveToolNames(): string[] }, names: readonly string[]): string[] {
+function missingBuiltinMcpTools(session: { getAllTools(): Array<{ name: string; exposure?: string }>; getActiveToolNames(): string[] }, selections: ReadonlyArray<{ name: string; selector: string }>) {
 	const active = new Set(session.getActiveToolNames());
-	const direct = new Set(session.getAllTools().filter((tool) => (tool as { exposure?: string }).exposure === "direct").map(({ name }) => name));
-	return names.filter((name) => !active.has(name) || !direct.has(name));
+	const tools = session.getAllTools();
+	const direct = new Set(tools.filter(({ exposure }) => exposure === "direct").map(({ name }) => name));
+	return selections.filter(({ name }) => !active.has(name) || !direct.has(name)).map(({ name, selector }) => {
+		const tool = tools.find((candidate) => candidate.name === name);
+		return { name, selector, registered: tool !== undefined, exposure: tool?.exposure ?? null, active: active.has(name) };
+	});
 }
 
 function flushQueuedProviderRegistrations(loader: InstanceType<PiCodingAgentModule["DefaultResourceLoader"]>, modelRuntime: ModelRuntimeInstance, onError: ((error: ChildSessionExtensionError) => void) | undefined, isRequiredSource: (extensionPath: string) => boolean): { claimedProviderIds: Set<string>; registered: boolean } {
@@ -695,8 +699,10 @@ export function createDefaultChildSessionFactory(options: DefaultChildSessionFac
 						await builtinMcp.waitForTools(signal, () => loader.getExtensions().errors.find(({ path }) => path === "builtin:mcp")?.error);
 						if (disposedSinceStart()) throw new Error("The child session factory was disposed while the child waited for its MCP tools.");
 						if (signal.aborted) throw new Error("The child launch was cancelled while waiting for its MCP tools.");
-						const missing = missingBuiltinMcpTools(session, builtinMcpTools.map(({ name }) => name));
-						if (missing.length) throw new Error(`Selected built-in MCP tools did not register in the child session: ${missing.join(", ")}. The MCP server may have failed to connect, or the name belongs to a different tool than the selector names; check it with /mcp.`);
+						const missing = missingBuiltinMcpTools(session, builtinMcpTools);
+						if (missing.length) {
+							throw new Error(`Selected built-in MCP tools did not register in the child session: ${missing.map(({ name }) => name).join(", ")}. The MCP server may have failed to connect, or the name belongs to a different tool than the selector names; check it with /mcp.\n\nMCP readiness diagnostics: ${JSON.stringify(missing)}`);
+						}
 					} catch (error) {
 						await shutdown();
 						throw error;
