@@ -23,11 +23,11 @@ import { projectScopeRequiresTrustMessage, resolveExecutionAgentScope } from "..
 import { handleManagementAction } from "../../agents/agent-management.ts";
 import { handleRefinementAction } from "../../agents/agent-refinements.ts";
 import { buildDoctorReport } from "../../extension/doctor.ts";
-import { readSubagentGuide } from "../../extension/subagent-guide.ts";
+import { readSubagentGuideTopic } from "../../extension/subagent-guide.ts";
 import { approveWorkflowChildLaunch, type SubagentLaunchArgs } from "../../extension/subagent-launch-tool.ts";
-import { isWorkflowScriptPath, normalizePublicSubagentExecution, validateWorkflowCapacityOverrides } from "../../extension/public-execution.ts";
+import { isWorkflowScriptPath, isWorkflowScriptText, normalizePublicSubagentExecution, validateWorkflowCapacityOverrides } from "../../extension/public-execution.ts";
 import { readReplyWorkflowScript } from "../../extension/reply-workflow-script.ts";
-import { disabledFeatureNotice, disabledFeatureSectionNotice, disabledFeatureUseError, resolveDisabledFeatureSurface, type DisabledFeatureSurface } from "../../shared/disabled-features.ts";
+import { disabledFeatureNotice, disabledFeatureSectionNotice, disabledFeatureUseError, resolveDisabledFeatureSurface, WORKFLOW_SCRIPTS_REPLACEMENT, type DisabledFeatureSurface } from "../../shared/disabled-features.ts";
 import { runSync } from "./execution.ts";
 import { commandAction } from "./command-action.ts";
 import { handleWatchdogToolAction, WATCHDOG_TOOL_ACTIONS } from "../../watchdog/tool-actions.ts";
@@ -64,7 +64,7 @@ import { canPreferFork, createForkContextResolver, resolveSubagentLaunchContext 
 import { createPrunedForkSessionWriter } from "../../shared/pruned-fork.ts";
 import { resolveCurrentSessionId } from "../../shared/session-identity.ts";
 import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
-import { SUBAGENT_ASYNC_COMPLETE_EVENT } from "../../shared/types.ts";
+import { assertJsonSchemaObject, SUBAGENT_ASYNC_COMPLETE_EVENT } from "../../shared/types.ts";
 import { resolveConfigDefaultTimeoutMs } from "../../extension/config.ts";
 import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBridge, resolveIntercomSessionTarget, resolveSubagentIntercomTarget, type IntercomBridgeState } from "../../intercom/intercom-bridge.ts";
 import { formatControlIntercomMessage, formatControlNoticeMessage, resolveControlConfig, shouldNotifyControlEvent } from "../shared/subagent-control.ts";
@@ -79,7 +79,7 @@ import { isAgentContract } from "../shared/agent-contract.ts";
 import { normalizeExtensionBindings, type ExtensionBindings } from "../shared/extension-bindings.ts";
 import { assertRequiredChildExtensionsAdmitted, hasMandatoryRequiredChildExtensions, readRetainedRequiredChildExtensions, resolveRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 import { capInlineOutput, finalizeSingleOutput, injectSingleOutputInstruction, normalizeSingleOutputOverride, outputPathMappingFromTask, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
-import { assertJsonSchemaObject, cleanupStructuredOutputRuntime, createStructuredOutputRuntime } from "../shared/structured-output.ts";
+import { cleanupStructuredOutputRuntime, createStructuredOutputRuntime } from "../shared/structured-output.ts";
 import { compactForegroundDetails, getSingleResultOutput, PROMPT_REDACTED, readStatus, resolveChildCwd, sumResultsCost, sumResultsUsage, toAgentToolUsage } from "../../shared/utils.ts";
 import { discardPreservedWorktrees, formatParallelHandoffError, formatParallelHandoffReference, protectRetainedWorktreeForResume, formatStoredParallelHandoffCleanup, parallelHandoffPath, readParallelHandoffManifest, recordParallelHandoffMerge, recordParallelHandoffSupersession, writeParallelHandoffGroup, writeWorktreeSetupHandoff } from "../shared/parallel-handoff.ts";
 import { summarizeContextModes, type ContextMode, type ContextSummary } from "../shared/context-mode.ts";
@@ -126,7 +126,7 @@ import { attachMissionToLaunchResult, missionAcceptanceStatus, prepareMissionLau
 import { MissionNotFoundError, updateMission } from "../../missions/store.ts";
 import type { MissionWorkflowChildUpdate } from "../../missions/types.ts";
 import { createMissionWorkflowState } from "../../missions/workflow-state.ts";
-import { managementActionAuthority } from "../../policy/authority.ts";
+import { authorityConfirmTitle, managementActionAuthority } from "../../policy/authority.ts";
 import { handleInspectorAction, INSPECTOR_ACTIONS } from "../../inspectors/actions.ts";
 import { getInspectorPlugins } from "../../inspectors/plugins.ts";
 import { handleHerdrProjectPaneAction, HERDR_PROJECT_PANE_ACTIONS } from "../../inspectors/herdr/project-panes.ts";
@@ -1516,6 +1516,7 @@ function appendStepToAsyncChain(input: {
 		chainSkills,
 		dynamicFanoutMaxItems: input.deps.config.chain?.dynamicFanout?.maxItems,
 		maxSubagentDepth: resolveCurrentMaxSubagentDepth(input.deps.config.maxSubagentDepth, input.deps.childRuntime),
+		configTimeoutMs: resolveConfigDefaultTimeoutMs(input.deps.config.timeoutMs),
 		contextForAgent: contextPolicy.contextForAgent,
 		worktreeBaseDir: input.deps.config.worktreeBaseDir,
 		worktreeProvider: input.deps.config.worktreeProvider,
@@ -1873,6 +1874,7 @@ function externalRunnerControlError(asyncDir: string, action: "steer" | "resume"
 async function resumeExternalJobFollowUp(input: {
 	target: AsyncResumeSourceTarget;
 	followUp: string;
+	requestedTimeout: Pick<SubagentParamsLike, "timeoutMs" | "maxRuntimeMs">;
 	baseAgentConfig: AgentConfig;
 	effectiveCwd: string;
 	requestCwd: string;
@@ -1917,6 +1919,10 @@ async function resumeExternalJobFollowUp(input: {
 		return { content: [{ type: "text", text: `Nested subagent resume blocked (depth=${depthState.depth}, max=${depthState.maxDepth}). Complete the follow-up directly instead.` }], isError: true, details: { mode: "management", results: [] } };
 	}
 	const topLevelResume = depthState.depth === 0 && !inheritedNestedRoute(input.deps) && !input.deps.state.workflowControllers?.has(input.target.runId);
+	const requested = input.requestedTimeout.timeoutMs === undefined && input.requestedTimeout.maxRuntimeMs === undefined ? { timeoutMs: input.baseAgentConfig.defaultTimeoutMs } : input.requestedTimeout;
+	const followUpTimeout = input.absoluteDeadlineAt !== undefined ? {} : resolveSingleAgentLaunchTimeout(requested, true, resolveConfigDefaultTimeoutMs(input.deps.config.timeoutMs), input.ctx.hasUI === true);
+	if (followUpTimeout.error) return { content: [{ type: "text", text: followUpTimeout.error }], isError: true, details: { mode: "management", results: [] } };
+	const followUpTimeoutMs = followUpTimeout.timeoutMs;
 	let activeAsyncCapacity: ActiveAsyncCapacityHandle | undefined;
 	try {
 		activeAsyncCapacity = topLevelResume ? acquireActiveAsyncCapacity({
@@ -1979,6 +1985,7 @@ async function resumeExternalJobFollowUp(input: {
 		availableModels: input.ctx.modelRegistry.getAvailable().map(toModelInfo),
 		outputBaseDir: resolveSingleRunOutputBaseDir(input.deps, artifactsDir, runId),
 		...(input.absoluteDeadlineAt !== undefined ? { absoluteDeadlineAt: input.absoluteDeadlineAt } : {}),
+		...(followUpTimeoutMs !== undefined ? { timeoutMs: followUpTimeoutMs } : {}),
 		capabilityCeiling: resolveCurrentSubagentCapabilityCeiling(input.ctx.sessionManager.getSessionId() ?? undefined),
 		runFanoutBudget: createRunFanoutBudget(runId, resolveMaxSubagentSpawnsPerRun(input.deps.config.maxSubagentSpawnsPerRun)),
 		activeAsyncCapacity,
@@ -2176,6 +2183,7 @@ async function resumeAsyncRun(input: {
 		const resumed = await resumeExternalJobFollowUp({
 			target,
 			followUp,
+			requestedTimeout: { timeoutMs: input.params.timeoutMs, maxRuntimeMs: input.params.maxRuntimeMs },
 			baseAgentConfig,
 			effectiveCwd,
 			requestCwd: input.requestCwd,
@@ -2280,6 +2288,7 @@ async function resumeAsyncRun(input: {
 			dynamicFanoutMaxItems: input.deps.config.chain?.dynamicFanout?.maxItems,
 			maxSubagentDepth: resolveCurrentMaxSubagentDepth(input.deps.config.maxSubagentDepth, input.deps.childRuntime),
 			worktreeSetupHook: input.deps.config.worktreeSetupHook,
+			configTimeoutMs: resolveConfigDefaultTimeoutMs(input.deps.config.timeoutMs),
 			worktreeSetupHookTimeoutMs: input.deps.config.worktreeSetupHookTimeoutMs,
 			worktreeBaseDir: input.deps.config.worktreeBaseDir,
 			baseRef: input.params.baseRef ?? target.recoveryDescriptor?.baseRef,
@@ -2352,6 +2361,9 @@ async function resumeAsyncRun(input: {
 	if (recoveryDescriptor?.share === true && restoredShareDisabledBy !== undefined) {
 		return { content: [{ type: "text", text: `Cannot resume: run '${target.runId}' was launched with share enabled, which config ${restoredShareDisabledBy} now disables. Re-enable session sharing to resume it.` }], isError: true, details: { mode: "management", results: [] } };
 	}
+	const agentTimeoutMs = input.params.timeoutMs === undefined && input.params.maxRuntimeMs === undefined ? recoveryAgentConfig.defaultTimeoutMs : undefined;
+	const resumeTimeout = input.absoluteDeadlineAt !== undefined ? {} : resolveSingleAgentLaunchTimeout(agentTimeoutMs === undefined ? input.params : { ...input.params, timeoutMs: agentTimeoutMs }, true, resolveConfigDefaultTimeoutMs(input.deps.config.timeoutMs), input.ctx.hasUI === true);
+	if (resumeTimeout.error) return { content: [{ type: "text", text: resumeTimeout.error }], isError: true, details: { mode: "management", results: [] } };
 	const runId = randomUUID();
 	const topLevelResume = depth === 0 && !inheritedNestedRoute(input.deps) && !input.params.workflowParentRunId;
 	let activeAsyncCapacity: ActiveAsyncCapacityHandle | undefined;
@@ -2462,7 +2474,7 @@ async function resumeAsyncRun(input: {
 		...(outputSchema ? { structuredOutputSchema: outputSchema } : {}),
 		...(recoveryDescriptor?.skills ? { skills: [...recoveryDescriptor.skills] } : {}),
 		...(acceptance !== undefined ? { acceptance } : {}),
-		...(input.params.timeoutMs !== undefined ? { timeoutMs: input.params.timeoutMs } : {}),
+		...(resumeTimeout.timeoutMs !== undefined ? { timeoutMs: resumeTimeout.timeoutMs } : {}),
 		...(input.absoluteDeadlineAt !== undefined ? { absoluteDeadlineAt: input.absoluteDeadlineAt } : {}),
 		...(input.params.toolBudget !== undefined ? { toolBudget: input.params.toolBudget } : {}),
 		// Recovery descriptors, remembered foreground runs, and current workflow roots
@@ -3123,14 +3135,6 @@ function validateLaunchOutputSchemaOverrides(params: SubagentParamsLike): string
 
 export const DEFAULT_FOREGROUND_TIMEOUT_MS = 30 * 60 * 1000;
 
-// Async single-agent runs also need a wall-clock backstop: a child whose bash
-// tool blocks forever (e.g. a background process inheriting the terminal with
-// no bash `timeout` arg) would otherwise hang the parent indefinitely with
-// zero signal. Same generous default as foreground; explicit timeoutMs/
-// maxRuntimeMs and agent-level defaultTimeoutMs remain authoritative.
-//
-// Deliberately NOT applied at the workflow level: async scripted workflows
-// stay unbounded as a whole, while each runner child has its own deadline.
 export { DEFAULT_ASYNC_TIMEOUT_MS };
 
 /**
@@ -3175,15 +3179,14 @@ export function resolveForegroundTimeout(params: SubagentParamsLike, defaultTime
  *
  * A global config default (`config.timeoutMs`, passed as `configDefaultTimeoutMs`)
  * replaces the built-in 30-minute backstop wherever a concrete default is applied.
- * The async default is deliberately applied only to plain single-agent launches.
  * Composite launches keep their top-level execution unbounded when no timeout is
  * set — even with a config default — while their runner children resolve separate
  * deadlines. Exported so the executor wiring is directly testable.
  */
-export function resolveSingleAgentLaunchTimeout(params: SubagentParamsLike, async: boolean, configDefaultTimeoutMs?: number): { timeoutMs?: number; error?: string } {
+export function resolveSingleAgentLaunchTimeout(params: SubagentParamsLike, async: boolean, configDefaultTimeoutMs?: number, interactive = false): { timeoutMs?: number; error?: string } {
 	const isComposite = (params.chain?.length ?? 0) > 0 || (params.tasks?.length ?? 0) > 0 || params.workflowScript !== undefined;
 	const foregroundDefault = configDefaultTimeoutMs ?? DEFAULT_FOREGROUND_TIMEOUT_MS;
-	const asyncSingleDefault = configDefaultTimeoutMs ?? DEFAULT_ASYNC_TIMEOUT_MS;
+	const asyncSingleDefault = configDefaultTimeoutMs ?? (interactive ? undefined : DEFAULT_ASYNC_TIMEOUT_MS);
 	const defaultTimeoutMs = !async ? foregroundDefault : isComposite ? undefined : asyncSingleDefault;
 	return resolveForegroundTimeout(params, defaultTimeoutMs);
 }
@@ -5595,7 +5598,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 	const scheduledOwnerExecutors = new Map<string | null, Map<string, { state: SubagentState; executor: ReturnType<typeof createSubagentExecutor> }>>();
 	const disabledFeatures = resolveDisabledFeatureSurface(deps.config);
 	const disabledFeatureResult = (params: SubagentParamsLike): AgentToolResult<Details> | undefined => {
-		const error = disabledFeatureUseError(params, disabledFeatures);
+		const error = disabledFeatureUseError(params, disabledFeatures, "subagent", ` ${WORKFLOW_SCRIPTS_REPLACEMENT}`);
 		if (!error) return undefined;
 		return { content: [{ type: "text", text: error }], isError: true, details: { mode: params.action === undefined ? inferExecutionMode(params) : "management", results: [] } };
 	};
@@ -7229,7 +7232,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				}
 				if (policyDecision === "confirm") {
 					if (!ctx.hasUI) return { content: [{ type: "text", text: `Authority policy requires user confirmation for action '${action}', but this session has no interactive UI.` }], isError: true, details: { mode: "management", results: [] } };
-					const confirmed = await ctx.ui.confirm(`Authorize subagent ${action}?`, `Authority policy requires confirmation before '${action}'.`);
+					const confirmed = await ctx.ui.confirm(authorityConfirmTitle(action), `Authority policy requires confirmation before '${action}'.`);
 					if (!confirmed) return { content: [{ type: "text", text: `Action '${action}' canceled; authority was not granted.` }], details: { mode: "management", results: [] } };
 				}
 			}
@@ -7376,11 +7379,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			}
 			if (action === "guide") {
 				try {
-					const guide = readSubagentGuide(paramsWithResolvedCwd.topic);
+					const guide = readSubagentGuideTopic(paramsWithResolvedCwd.topic);
 					const notice = paramsWithResolvedCwd.topic?.includes("/") ? disabledFeatureSectionNotice(disabledFeatures) : disabledFeatureNotice(disabledFeatures);
 					return {
-						content: [{ type: "text", text: notice ? `${notice}\n\n${guide}` : guide }],
-						details: { mode: "management", results: [] },
+						content: [{ type: "text", text: notice ? `${notice}\n\n${guide.text}` : guide.text }],
+						details: { mode: "management", results: [], ...(guide.view ? { guideTopic: guide.view } : {}) },
 					};
 				} catch (error) {
 					return {
@@ -8002,6 +8005,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			effectiveParams,
 			effectiveAsync,
 			resolveConfigDefaultTimeoutMs(deps.config.timeoutMs),
+			ctx.hasUI === true,
 		);
 		if (foregroundTimeout.error) return buildRequestedModeError(effectiveParams, foregroundTimeout.error);
 		const controlConfig = resolveControlConfig(deps.config.control, effectiveParams.control);
@@ -8473,7 +8477,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const workflow = publicParams.workflow;
 		const errorResult = (text: string): Promise<AgentToolResult<Details>> => Promise.resolve({ content: [{ type: "text", text }], isError: true, details: { mode: publicParams.action ? "management" : "workflow", results: [] } });
 		// Models tend to put script text in the workflow string; say how to pass it instead.
-		const scriptTextHint = " A workflow string is a named workflow resource or a script file path. To run script text, write it in one ```js workflow block in the same reply and call subagent({ workflow: true }).";
+		const scriptTextHint = " A workflow string is a named workflow resource or a script file path. To run script text, pass it as options.script, or write it in one ```js workflow block in the same reply and call subagent({ workflow: true }).";
 		let workflowLaunch: WorkflowLaunch | undefined;
 		const workflowResumeLaunch = workflowResumeLaunches.get(params);
 		if (publicParams.tasks !== undefined || publicParams.chain !== undefined) {
@@ -8485,6 +8489,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			publicParams = { ...withoutStructuredInput, workflowScript: resolved.resource.script };
 			workflowResourcePermits.set(publicParams, resolved.resource.permit);
 			workflowLaunch = { source: "structured" };
+		} else if (typeof workflow === "string" && isWorkflowScriptText(workflow)) {
+			return errorResult(`The workflow string has line breaks, so it is script text, not a file path, and was not run.${scriptTextHint}`);
 		} else if (typeof workflow === "string" && !isWorkflowScriptPath(workflow)) {
 			const resolved = resolveWorkflowResource(workflow, publicParams.args, ctx.sessionManager.getSessionId() ?? undefined);
 			// A resumed resource is resolved with current authority and must still be the script that ran.

@@ -84,7 +84,7 @@ Use top-level `await`, plain helper functions, or Promise chains; nested async f
 The `workflow` field selects the script source:
 
 - `workflow: true` runs the one ```` ```js workflow ```` fenced block written in the same assistant reply as the `subagent` call. The script is plain text in the reply, so it needs no JSON string escaping. A reply can carry exactly one such block and one `workflow: true` call; zero or several blocks fail. A reply with no tagged block may instead carry exactly one plain ```` ```js ```` block, which then runs. A line containing only ```` ``` ```` (three or more backticks, optionally followed by spaces or tabs) ends the block, so keep Markdown fences inside quoted strings.
-- A string containing `/` (or `\` in a Windows path), such as `workflow: "./workflows/review.js"`, is a script file.
+- A string containing `/` (or `\` in a Windows path), such as `workflow: "./workflows/review.js"`, is a script file. A string with line breaks is script text and is refused without reading any file; pass script source as `options.script` instead.
 - Any other string, such as `workflow: "review"`, is a [named workflow resource](#named-workflow-resources-for-permission-extensions). The string `"true"` is read as `workflow: true`, because some MCP clients send the boolean as a string.
 
 `workflow: true` works only from a model tool call. Slash commands, RPC, and schedules pass scripts through their own inputs. Examples below that show only a ```` ```js workflow ```` block run with `subagent({ workflow: true })` in the same reply.
@@ -228,7 +228,7 @@ return patch.output;
 
 ### Parallel sequential lanes
 
-For a bounded set of independent chains, `runs.lanes(...)` removes the mechanical loop that would otherwise connect each lane's stages. It is a helper inside a workflow script, not a new top-level `subagent` execution mode:
+For a bounded set of independent chains, `runs.lanes(...)` removes the mechanical loop that would otherwise connect each lane's stages. It is a helper inside a workflow script, not a new top-level `subagent` execution mode. Run the block below with `subagent({ workflow: true })` in the same reply, or pass its source as `options.script`; script rules are in `workflows/scripted-workflows`. Each stage is its own run. A stage with no `timeoutMs` from the stage, its agent or config has no deadline in an interactive session, where the parent gets a check-in every 30 minutes while it runs, and stops at 30 minutes in a session without a UI. Set `timeoutMs` on a stage to bound it, or on the workflow call to bound the whole workflow.
 
 ```js workflow
 const board = await runs.lanes([

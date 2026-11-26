@@ -29,6 +29,12 @@ export type AcceptanceRole = "read-only" | "writer";
 
 export type JsonSchemaObject = Record<string, unknown>;
 
+export function assertJsonSchemaObject(schema: unknown, label = "outputSchema"): asserts schema is JsonSchemaObject {
+	if (!schema || typeof schema !== "object" || Array.isArray(schema)) {
+		throw new Error(`${label} must be a JSON Schema object.`);
+	}
+}
+
 export interface ChainOutputMapEntry {
 	text: string;
 	structured?: unknown;
@@ -344,6 +350,7 @@ export interface ResolvedControlConfig {
 	failedToolAttemptsBeforeAttention: number;
 	notifyOn: ControlEventType[];
 	notifyChannels: ControlNotificationChannel[];
+	checkInAfterMs?: number;
 }
 
 /**
@@ -376,7 +383,7 @@ export interface ControlEvent {
 	nestedRunId?: string;
 	nestingPath?: NestedRunAddress["path"];
 	message: string;
-	reason?: "idle" | "active_long_running" | "tool_failures" | "supervisor_request" | "time_threshold" | "turn_threshold" | "token_threshold" | "tool_open_threshold";
+	reason?: "idle" | "active_long_running" | "tool_failures" | "supervisor_request" | "time_threshold" | "turn_threshold" | "token_threshold" | "tool_open_threshold" | "check_in";
 	turns?: number;
 	tokens?: number;
 	toolCount?: number;
@@ -1443,10 +1450,27 @@ export interface AgentCapabilityRow {
 	extensions?: { names?: string[]; subagentOnly?: string[]; skills?: string[] };
 }
 
+export interface GuideSummary {
+	tokens: number;
+	launch: string[];
+	manage: string[];
+	agents: string[];
+	again?: boolean;
+	attached?: boolean;
+}
+
+export interface GuideTopicView {
+	title: string;
+	lead: string;
+}
+
 export interface Details {
 	commands?: import("../runs/shared/child-commands.ts").ChildCommandSnapshot[];
 	mode: SubagentResultMode | "management";
 	taught?: string[];
+	guide?: GuideSummary;
+	heldLaunch?: string;
+	guideTopic?: GuideTopicView;
 	workflowReceiptPath?: string;
 	runId?: string;
 	/** Host tool-call id retained when it differs from the internal run id. */
@@ -1820,8 +1844,16 @@ export interface HerdrLocalMachineReference {
 	cwd: string;
 }
 
+export interface HerdrCoreLocalMachineReference {
+	provider: "herdr-core";
+	id: "local";
+	socket: string;
+	parentTerminal: string;
+	cwd: string;
+}
+
 /** Where a placed native Pi child runs. A reference without `target` is on this machine. */
-export type PlacementMachineReference = HerdrMachineReference | HerdrLocalMachineReference | RexMachineReference;
+export type PlacementMachineReference = HerdrMachineReference | HerdrLocalMachineReference | HerdrCoreLocalMachineReference | RexMachineReference;
 
 export interface ExternalCliMachineStatus extends HerdrMachineReference {
 	remoteGit?: HerdrRemoteGitStatus;
@@ -2620,7 +2652,7 @@ export interface RunSyncOptions {
 	nestedRoute?: NestedRouteInfo;
 	/** Override the agent's default model (format: "provider/id" or just "id") */
 	modelOverride?: string;
-	/** Opt into priority service tier for supported native OpenAI-Codex launches. */
+	/** Request the configured OpenAI service tier on compatible native adapters. */
 	fast?: boolean;
 	/** The override came from the running parent session, not configuration. */
 	modelOverrideFromParent?: boolean;
@@ -2773,7 +2805,7 @@ export interface ExtensionConfig {
 	asyncWidgetLayout?: AsyncWidgetLayout;
 	/** Report subagent run state to the terminal with OSC 7501. Defaults to true. */
 	programStatus?: boolean;
-	/** OpenAI-Codex `service_tier` that `fast: true` requests for native children. Defaults to "priority". */
+	/** OpenAI `service_tier` that `fast: true` requests on compatible native adapters. Defaults to "priority". */
 	fastServiceTier?: FastServiceTier;
 	/** Add a short `active_subagents` system prompt section listing this session's active background runs. Defaults to false. */
 	activeRunsPrompt?: boolean;
@@ -2808,12 +2840,10 @@ export interface ExtensionConfig {
 	/** Global cap on simultaneously-running subagent tasks within a single run. Defaults to 20. */
 	globalConcurrencyLimit?: number;
 	/**
-	 * Global default runtime deadline in milliseconds. It replaces the built-in
-	 * 30-minute backstop for single, parallel, and chain launches (foreground, plus
-	 * plain single-agent async runs) when neither the call (`timeoutMs`/`maxRuntimeMs`)
-	 * nor the selected agent provides a timeout. Explicit call values and agent
-	 * frontmatter defaults still win. Composite async runs (chain/parallel/workflow)
-	 * stay unbounded at the top level by design — their children are bounded individually.
+	 * Global default runtime deadline in milliseconds, used when neither the call
+	 * (`timeoutMs`/`maxRuntimeMs`) nor the selected agent provides a timeout. It applies
+	 * to foreground launches, background single-agent runs and resumes, and each child of
+	 * an async composite; the composite itself stays unbounded at the top level.
 	 * Must be a positive integer; invalid values are ignored.
 	 */
 	timeoutMs?: number;

@@ -17,7 +17,8 @@ const SETTING = `disabledFeatures "workflow-scripts"`;
 const DISABLED: ExtensionConfig = { disabledFeatures: ["workflow-scripts"] };
 const surface = resolveDisabledFeatureSurface(DISABLED);
 const LEGACY_ERROR = "Legacy top-level chain and parallel inputs were removed; use a workflow script (workflow: true or a workflow script path).";
-const SCRIPTS_DISABLED = `subagent workflow scripts are disabled by config ${SETTING}.`;
+const REPLACEMENT = " Instead of workflow scripts, use the top-level tasks or chain fields.";
+const SCRIPTS_DISABLED = `subagent workflow scripts are disabled by config ${SETTING}.${REPLACEMENT}`;
 
 function createExecutor(config: ExtensionConfig) {
 	return createSubagentExecutor({
@@ -58,7 +59,7 @@ describe("workflow-scripts tool surface", () => {
 		const enabled = formatGuide([], { canLaunch: true, disabled: resolveDisabledFeatureSurface({}) });
 		assert.match(enabled, /Parallel: subagent\(\{workflow:"parallel"/);
 		const guide = formatGuide([], { canLaunch: true, disabled: surface });
-		assert.doesNotMatch(guide, /workflow:|topic:"workflows"/);
+		assert.doesNotMatch(guide, /workflow:|topic:"workflows/);
 		for (const text of ["Parallel: subagent({tasks:[{agent, task, cwd?, model?}]})", "Dependent steps: subagent({task, chain:[{agent, task?, as?}]})", "{previous}", "{outputs.<as>}", "use the top-level tasks or chain fields"]) {
 			assert.ok(guide.includes(text), `guide lacks ${text}`);
 		}
@@ -78,7 +79,7 @@ describe("workflow-scripts admission", () => {
 		const executor = createExecutor(DISABLED);
 		for (const workflow of [true, "./flow.js", "review"]) {
 			const result = await executor.executePublic("workflow", { workflow } as SubagentParamsLike, new AbortController().signal, undefined, ctx());
-			assert.equal(resultText(result), `subagent option 'workflow' is disabled by config ${SETTING}.`);
+			assert.equal(resultText(result), `subagent option 'workflow' is disabled by config ${SETTING}.${REPLACEMENT}`);
 		}
 		const script = { workflowScript: "return 1;", async: true };
 		assert.equal(resultText(await executor.executePublic("public", script, new AbortController().signal, undefined, ctx())), SCRIPTS_DISABLED);
@@ -106,6 +107,7 @@ describe("workflow-scripts admission", () => {
 			return (replies.get(subagentRpcReplyEvent(requestId)) as { error?: { code: string; message: string } }).error;
 		};
 		assert.deepEqual(await spawn("script", { script: "return 1;" }), { code: "invalid_params", message: `RPC spawn workflow scripts are disabled by config ${SETTING}.` });
+		assert.deepEqual(await spawn("script-text", { workflow: "const r = 1;\nreturn r;" }), { code: "invalid_params", message: `RPC spawn option 'workflow' is disabled by config ${SETTING}.` });
 		// Normalization would otherwise report "args requires workflow." and hide the setting.
 		assert.deepEqual(await spawn("args", { agent: "scout", task: "x", args: {} }), { code: "invalid_params", message: `RPC spawn option 'args' is disabled by config ${SETTING}.` });
 		assert.equal((await spawn("chain", { chain: [{ agent: "scout", task: "x" }] }))?.message, LEGACY_ERROR);

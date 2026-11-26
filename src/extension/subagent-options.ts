@@ -5,7 +5,7 @@ import { Value } from "typebox/value";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import type { DisabledFeatureSurface } from "../shared/disabled-features.ts";
 import { closestMatch } from "../shared/edit-distance.ts";
-import { removedModelWorkflowFieldError } from "./public-execution.ts";
+import { isWorkflowScriptText, removedModelWorkflowFieldError } from "./public-execution.ts";
 import { SUBAGENT_OPTION_KEYS, SubagentFlatParams, SubagentOptionParams, SubagentParams, createSubagentParamsSchema } from "./schemas.ts";
 
 const optionKeys = new Set(SUBAGENT_OPTION_KEYS);
@@ -39,13 +39,20 @@ function parseJsonText(text: string): unknown {
 	}
 }
 
-function convertField(key: string, value: unknown, schema: TSchema): unknown {
+function convertField(key: string, value: unknown, schema: TSchema, workflowCall: boolean): unknown {
 	const validator = fieldValidator(schema);
 	if (typeof value === "string" && validator.Check(value)) {
 		const spelled = value === "true" ? true : value === "false" ? false : parseJsonText(value);
 		return spelled !== undefined && validator.Check(spelled) ? spelled : value;
 	}
 	if (validator.Check(value)) return value;
+	const numeric = (schema as { type?: unknown }).type === "integer" || (schema as { type?: unknown }).type === "number";
+	if (numeric && (typeof value === "boolean" || value === "true" || value === "false")) {
+		const hint = workflowCall
+			? `For a workflow call, set ${key} on each child in a workflow: true script.`
+			: `If your fields arrive missing or changed, pass them inside args: subagent({..., args:{${key}: <number>}}).`;
+		throw new Error(`subagent: '${key}' must be a number, not ${JSON.stringify(value)}. ${hint}`);
+	}
 	const converted = Value.Convert(schema, structuredClone(value));
 	if (validator.Check(converted)) return converted;
 	if (typeof value !== "string" || !/^\s*[[{]/.test(value)) return value;
@@ -57,12 +64,12 @@ function convertField(key: string, value: unknown, schema: TSchema): unknown {
 	return parsed;
 }
 
-function convertFields(fields: Record<string, unknown>, schemas: Record<string, TSchema>): Record<string, unknown> {
+function convertFields(fields: Record<string, unknown>, schemas: Record<string, TSchema>, workflowCall: boolean): Record<string, unknown> {
 	let converted: Record<string, unknown> | undefined;
 	for (const [key, value] of Object.entries(fields)) {
 		const schema = schemas[key];
 		if (!schema || isUnsetPlaceholder(value)) continue;
-		const next = convertField(key, value, schema);
+		const next = convertField(key, value, schema, workflowCall);
 		if (next !== value) (converted ??= { ...fields })[key] = next;
 	}
 	return converted ?? fields;
@@ -70,9 +77,10 @@ function convertFields(fields: Record<string, unknown>, schemas: Record<string, 
 
 export function prepareSubagentToolArguments(args: unknown): unknown {
 	if (!isPlainObject(args)) return args;
-	const converted = convertFields(args, MODEL_FIELDS);
+	const workflowCall = args.workflow !== undefined && !isUnsetPlaceholder(args.workflow) && args.workflow !== false && args.workflow !== "false";
+	const converted = convertFields(args, MODEL_FIELDS, workflowCall);
 	if (!isPlainObject(converted.options)) return converted;
-	const options = convertFields(converted.options, SubagentOptionParams.properties);
+	const options = convertFields(converted.options, SubagentOptionParams.properties, workflowCall);
 	return options === converted.options ? converted : { ...converted, options };
 }
 
@@ -110,6 +118,7 @@ export function flattenSubagentToolOptions(params: Record<string, unknown>, disa
 	if (removedTopLevel) throw new Error(removedTopLevel);
 	const { options, ...topLevel } = params;
 	checkTopLevelFields(topLevel, disabled);
+	if (!disabled?.params.has("workflow") && typeof topLevel.workflow === "string" && isWorkflowScriptText(topLevel.workflow)) throw new Error("subagent: workflow has line breaks, so it is script text; pass it as options.script (or a ```js workflow block with workflow: true).");
 	if (options === undefined) return topLevel;
 	if (!options || typeof options !== "object" || Array.isArray(options)) throw new Error("subagent: options must be an object.");
 	const removedField = removedModelWorkflowFieldError(options);
