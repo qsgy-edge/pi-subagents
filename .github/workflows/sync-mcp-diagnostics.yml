@@ -75,20 +75,21 @@ jobs:
 
   publish:
     needs: verify
-    if: needs.verify.outputs.candidate != ''
+    # A manual run can verify the publisher even when the branch is current.
+    if: needs.verify.result == 'success' && (needs.verify.outputs.candidate != '' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions:
-      contents: write
+    environment: mcp-diagnostics-publish
     steps:
       - uses: actions/download-artifact@v4
+        if: needs.verify.outputs.candidate != ''
         with:
           name: sync-candidate
           path: ${{ runner.temp }}/verified
-      - name: Advance only the diagnostics branch
+      - name: Check the verified candidate against the remote branch
+        if: needs.verify.outputs.candidate != ''
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
           CANDIDATE: ${{ needs.verify.outputs.candidate }}
         run: |
           set -euo pipefail
@@ -100,5 +101,23 @@ jobs:
           git fetch "$RUNNER_TEMP/verified/candidate.bundle" refs/heads/sync-candidate:refs/heads/sync-candidate
           test "$(git rev-parse refs/heads/sync-candidate)" = "$CANDIDATE"
           git merge-base --is-ancestor "$previous" "$CANDIDATE"
-          gh auth setup-git --hostname github.com
-          git push origin refs/heads/sync-candidate:refs/heads/mcp-readiness-diagnostics
+      - name: Create diagnostics publisher token
+        id: publisher
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.MCP_DIAGNOSTICS_APP_CLIENT_ID }}
+          private-key: ${{ secrets.MCP_DIAGNOSTICS_APP_PRIVATE_KEY }}
+          owner: qsgy-edge
+          repositories: pi-subagents
+          permission-contents: write
+          permission-workflows: write
+      - name: Advance only the diagnostics branch
+        if: needs.verify.outputs.candidate != ''
+        shell: bash
+        working-directory: ${{ runner.temp }}/publish.git
+        env:
+          GH_TOKEN: ${{ steps.publisher.outputs.token }}
+        run: |
+          set -euo pipefail
+          git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+            push origin refs/heads/sync-candidate:refs/heads/mcp-readiness-diagnostics
