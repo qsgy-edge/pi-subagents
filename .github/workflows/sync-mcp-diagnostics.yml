@@ -49,12 +49,15 @@ jobs:
           set -euo pipefail
           git grep -qF 'MCP readiness diagnostics:' HEAD -- src/runs/shared/child-session.ts
           npm ci --ignore-scripts
+          git diff --exit-code --name-status HEAD --
           npm run typecheck
           npm install --prefix "$RUNNER_TEMP/native-pi" --no-package-lock --ignore-scripts @earendil-works/pi-coding-agent@1.6.0
           export PI_SUBAGENTS_NATIVE_PI_ROOT="$(cygpath -m "$RUNNER_TEMP/native-pi")/node_modules/@earendil-works/pi-coding-agent"
           loader=$(node -p 'require("node:url").pathToFileURL("test/support/native-peer-loader.mjs").href')
           export NODE_OPTIONS="--import=$loader"
+          git diff --exit-code --name-status HEAD --
           node --experimental-strip-types --import ./test/support/register-loader.mjs --test test/integration/in-process-child.test.ts test/integration/builtin-mcp-readiness.test.ts test/unit/child-session-scoped-dispose.test.ts
+          git diff --exit-code --name-status HEAD --
       - name: Bundle verified candidate
         if: steps.merge.outputs.candidate != ''
         shell: bash
@@ -87,6 +90,7 @@ jobs:
           name: sync-candidate
           path: ${{ runner.temp }}/verified
       - name: Check the verified candidate against the remote branch
+        id: candidate
         if: needs.verify.outputs.candidate != ''
         shell: bash
         env:
@@ -101,6 +105,7 @@ jobs:
           git fetch "$RUNNER_TEMP/verified/candidate.bundle" refs/heads/sync-candidate:refs/heads/sync-candidate
           test "$(git rev-parse refs/heads/sync-candidate)" = "$CANDIDATE"
           git merge-base --is-ancestor "$previous" "$CANDIDATE"
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
       - name: Create diagnostics publisher token
         id: publisher
         uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
@@ -117,7 +122,11 @@ jobs:
         working-directory: ${{ runner.temp }}/publish.git
         env:
           GH_TOKEN: ${{ steps.publisher.outputs.token }}
+          CANDIDATE: ${{ needs.verify.outputs.candidate }}
+          PREVIOUS: ${{ steps.candidate.outputs.previous }}
         run: |
           set -euo pipefail
+          branch=refs/heads/mcp-readiness-diagnostics
           git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
-            push origin refs/heads/sync-candidate:refs/heads/mcp-readiness-diagnostics
+            push --force-with-lease="$branch:${PREVIOUS:?missing checked branch tip}" \
+            origin "${CANDIDATE:?missing verified candidate}:$branch"
