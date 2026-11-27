@@ -87,8 +87,11 @@ describe("subagent extension child mode", () => {
 				registeredTool.renderCall({ workflow: true, async: true }, theme).text,
 				registeredTool.renderCall({ workflow: "./ci/sweep.js" }, theme).text,
 				registeredTool.renderCall({ workflow: "review" }, theme).text,
+				registeredTool.renderCall({ args: { agent: "probe", task: "Inspect" } }, theme).text,
+				registeredTool.renderCall({ args: { action: "status" } }, theme).text,
+				registeredTool.renderCall({ args: { workflow: "parallel", args: { tasks: [] } } }, theme).text,
 			];
-			const expected = ["subagent workflow (reply block) [async]", "subagent workflow ./ci/sweep.js", "subagent workflow review"];
+			const expected = ["subagent workflow (reply block) [async]", "subagent workflow ./ci/sweep.js", "subagent workflow review", "subagent probe", "subagent status", "subagent workflow parallel"];
 			if (JSON.stringify(rows) !== JSON.stringify(expected)) throw new Error("expected " + JSON.stringify(expected) + ", got " + JSON.stringify(rows));
 		`;
 		execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(), stdio: "pipe" });
@@ -106,7 +109,7 @@ describe("subagent extension child mode", () => {
 				registerCommand() {}, registerShortcut() {}, registerMessageRenderer() {}, sendMessage() {}, getSessionName() {},
 			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
 			registerSubagentExtension(makePi("parent"));
-			registerFanoutChildSubagentExtension(makePi("fanout"), { fanoutChild: true, depth: 1, waitTool: { enabled: true }, fast: false });
+			registerFanoutChildSubagentExtension(makePi("fanout"), { fanoutChild: true, depth: 1, fast: false });
 			const expanded = [];
 			const ctx = {
 				cwd: process.cwd(), isIdle() { return false; }, hasUI: true,
@@ -203,7 +206,6 @@ describe("subagent extension child mode", () => {
 			const expanded = render([reply, launch, workflow], true).join("\n");
 			assert.match(expanded, /Every runs\.run item needs a stable key\./);
 			assert.doesNotMatch(expanded, /↳/);
-			process.stdout.write(JSON.stringify({ folded, expanded: render([reply, launch, workflow], true) }));
 		`;
 
 		execFileSync(
@@ -1906,7 +1908,7 @@ describe("subagent extension child mode", () => {
 			import registerFanoutChildSubagentExtension from "./src/extension/fanout-child.ts";
 			import { SUBAGENT_CHILD_ENV } from "./src/runs/shared/child-runtime-config.ts";
 			process.env[SUBAGENT_CHILD_ENV] = "1";
-			const childRuntime = { fanoutChild: true, depth: 1, waitTool: { enabled: true }, fast: false };
+			const childRuntime = { fanoutChild: true, depth: 1, fast: false };
 
 			const registeredNames = new Set();
 			const registrations = [];
