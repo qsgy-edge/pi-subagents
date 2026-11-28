@@ -8,6 +8,12 @@
 
 <https://github.com/user-attachments/assets/702554ec-faaf-4635-80aa-fb5d6e292fd1>
 
+## What's new in 0.91
+
+https://github.com/user-attachments/assets/859acad5-2fc0-4d10-b915-77c184de5c12
+
+The tool descriptions and skill are gone, replaced by one self-teaching subagent tool: its first call returns a guide, and each feature's first use comes back with a tip. It takes about 5x less context than 0.90 once your agent delegates, with every feature kept. In an interactive session, background runs without a `timeoutMs` no longer stop at 30 minutes; your agent gets a check-in instead. If your instructions load the `pi-subagents` skill, use `subagent({action:"guide"})` instead. See the [changelog](CHANGELOG.md) for everything else.
+
 ## Install
 
 ```bash
@@ -44,7 +50,7 @@ Pi is the parent session. A subagent is a focused child Pi session with its own 
 
 When you ask for a subagent, Pi starts the child, gives it the task, and brings the result back. Foreground children run as sessions inside the parent Pi process and stream in the conversation. Background children run as sessions inside a detached runner process that keeps working and can be checked later.
 
-Installing the extension does not start an automatic reviewer in the background. Every session declares one small `subagent` tool that never changes during the session, plus `contact_supervisor`. It is light on context: about 300 tokens per request before a session delegates and about 1,500 after (measured on Claude). Its first reply is the guide: the agents you have, the launch fields, and the actions; a launch made before that is held once. Later replies explain each new thing once, when it first happens. Waiting (`action: "wait"`) and answering a child's question (`action: "reply"`) are actions of the same tool. When to delegate is up to you and your project instructions; the tool only says what it does.
+Installing the extension does not start an automatic reviewer in the background. Every session declares one small `subagent` tool that never changes during the session, plus `contact_supervisor`. It is light on context: about 300 tokens per request before a session delegates and about 1,600 after (measured on Claude). Its first reply is the guide: the agents you have, the launch fields, and the actions; a launch made before that is held once. Later replies explain each new thing once, when it first happens. In a test with no skills or project instructions, a fresh agent asked to fix three bugs with subagents launched all three fixes in parallel on its first try, in every run ([how it was measured](docs/tool-reference.md#cold-start)). Waiting (`action: "wait"`) and answering a child's question (`action: "reply"`) are actions of the same tool. When to delegate is up to you and your project instructions; the tool only says what it does.
 
 If you want every implementation reviewed, say so in your prompt or project instructions:
 

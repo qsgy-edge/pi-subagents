@@ -729,6 +729,13 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 	if (!binaryHost && !piPackageRoot) {
 		return { error: `Background children require a supported standalone Pi host or the installed npm package (${PI_CODING_AGENT_PACKAGE}); neither is available.` };
 	}
+	// The root is resolved once at load, so an upgrade that removes it mid-session must not read as missing peers.
+	if (!binaryHost && piPackageRoot && !fs.existsSync(piPackageRoot)) {
+		const fix = process.env[PI_CODING_AGENT_PACKAGE_ROOT_ENV]?.trim() === piPackageRoot
+			? `${PI_CODING_AGENT_PACKAGE_ROOT_ENV} names it; point it at the current Pi install or unset it, then restart Pi`
+			: "restart Pi";
+		return { error: `Background children require the host npm package (${PI_CODING_AGENT_PACKAGE}), but its directory ${piPackageRoot} no longer exists; ${fix}.` };
+	}
 	const hostPeerAliases = !binaryHost && piPackageRoot ? resolveHostPeerAliases(piPackageRoot) : { aliases: {}, missing: [] };
 	if (hostPeerAliases.missing.length > 0) {
 		return { error: `Background children require the host npm package (${PI_CODING_AGENT_PACKAGE}) with its dependencies; ${piPackageRoot} does not provide ${hostPeerAliases.missing.join(", ")}.` };
@@ -1006,9 +1013,6 @@ function formatAsyncStartError(mode: SubagentRunMode, message: string): AsyncExe
 	};
 }
 
-const UNAVAILABLE_SUBAGENT_SKILL_ERROR = "Skills not found: pi-subagents";
-
-class UnavailableSubagentSkillError extends Error {}
 class AsyncStartValidationError extends Error {}
 
 export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildParams): AsyncRunnerStepBuildResult {
@@ -1173,14 +1177,13 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			resolvedBehavior: effectiveBehavior,
 		});
 		const { stepCwd, instructionCwd, readExistenceCwd, behavior, namespaceOutputPath, outputPath, skillNames } = launchPlan;
-		const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(
+		const { resolved: resolvedSkills } = resolveSkillsWithFallback(
 			skillNames,
 			stepCwd,
 			ctx.cwd,
 			a.skillPath,
 			a.filePath ? path.dirname(a.filePath) : stepCwd,
 		);
-		if (missingSkills.includes("pi-subagents")) throw new UnavailableSubagentSkillError(UNAVAILABLE_SUBAGENT_SKILL_ERROR);
 
 		const systemPrompt = buildEffectiveSystemPrompt({ agent: a, resolvedSkills, cwd: stepCwd });
 
@@ -1494,7 +1497,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		}
 		return { steps: steps as RunnerStep[], runnerCwd, workflowGraph, eventChain: graphChain, ...(originalTask !== undefined ? { originalTask } : {}), ...(launcher !== undefined ? { launcher } : {}) };
 	} catch (error) {
-		if (error instanceof UnavailableSubagentSkillError || error instanceof AsyncStartValidationError) return { error: error.message };
+		if (error instanceof AsyncStartValidationError) return { error: error.message };
 		throw error;
 	}
 }
@@ -1976,14 +1979,13 @@ export function executeAsyncSingle(
 	const readExistenceCwd = params.worktree === true ? runnerCwd : instructionCwd;
 	const skillNames = params.skills ?? agentConfig.skills ?? [];
 	const availableModels = params.availableModels;
-	const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(
+	const { resolved: resolvedSkills } = resolveSkillsWithFallback(
 		skillNames,
 		runnerCwd,
 		ctx.cwd,
 		agentConfig.skillPath,
 		agentConfig.filePath ? path.dirname(agentConfig.filePath) : runnerCwd,
 	);
-	if (missingSkills.includes("pi-subagents")) return formatAsyncStartError("single", UNAVAILABLE_SUBAGENT_SKILL_ERROR);
 
 	const inheritedNestedRoute = inheritedNestedRouteOf(ctx.childRuntime);
 	const nestedAddress = inheritedNestedRoute ? inheritedNestedParentAddressOf(ctx.childRuntime) : undefined;

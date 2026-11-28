@@ -2176,9 +2176,10 @@ syncBuiltinESMExports();
 		fs.mkdirSync(childCwd, { recursive: true });
 		const registration = registerRequiredChildExtensions({ sessionId: "session-123", extensions: [{ id: "host-policy", path: fileURLToPath(import.meta.url) }], requireForAllRunners: true });
 		const agents = [makeAgent("external", { runner: { type: "external-cli", command: process.execPath, args: ["-e", ""] } })];
-		// The child's own agent discovery runs after workflow admission and before its launch: dispose there.
+		// Validation discovers the child's agent at its cwd before admission; the second discovery there is the launch's, after admission: dispose there.
+		let childDiscoveries = 0;
 		const executor = makeAsyncExecutor(agents, {}, (cwd) => {
-			if (cwd === childCwd) registration.dispose();
+			if (cwd === childCwd && ++childDiscoveries === 2) registration.dispose();
 			return { agents };
 		});
 		try {
@@ -2364,56 +2365,6 @@ syncBuiltinESMExports();
 		}));
 		assert.equal(prompts.filter((prompt) => /one async local skill/.test(prompt) && !/two async local skill/.test(prompt)).length, 1);
 		assert.equal(prompts.filter((prompt) => /two async local skill/.test(prompt) && !/one async local skill/.test(prompt)).length, 1);
-	});
-
-	it("background single runs report unavailable pi-subagents skill requests", () => {
-		const id = `async-pi-subagents-skill-${Date.now().toString(36)}`;
-		const result = executeAsyncSingle(id, {
-			agent: "worker",
-			task: "Do work",
-			agentConfig: makeAgent("worker"),
-			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
-			cwd: tempDir,
-			artifactConfig: {
-				enabled: false,
-				includeInput: false,
-				includeOutput: false,
-				includeJsonl: false,
-				includeMetadata: false,
-				cleanupDays: 7,
-			},
-			shareEnabled: false,
-			sessionRoot: path.join(tempDir, "sessions"),
-			skills: ["pi-subagents"],
-			maxSubagentDepth: 2,
-		});
-
-		assert.equal(result.isError, true);
-		assert.match(result.content[0]?.text ?? "", /Skills not found: pi-subagents/);
-	});
-
-	it("background chains report unavailable pi-subagents skill requests", () => {
-		const id = `async-chain-pi-subagents-skill-${Date.now().toString(36)}`;
-		const result = executeAsyncChain(id, {
-			chain: [{ agent: "worker", task: "Do work", skill: ["pi-subagents"] }],
-			agents: [makeAgent("worker")],
-			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
-			cwd: tempDir,
-			artifactConfig: {
-				enabled: false,
-				includeInput: false,
-				includeOutput: false,
-				includeJsonl: false,
-				includeMetadata: false,
-				cleanupDays: 7,
-			},
-			shareEnabled: false,
-			sessionRoot: path.join(tempDir, "sessions"),
-			maxSubagentDepth: 2,
-		});
-
-		assert.equal(result.isError, true);
-		assert.match(result.content[0]?.text ?? "", /Skills not found: pi-subagents/);
 	});
 
 	it("background chains resolve relative step cwd values against the shared cwd", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

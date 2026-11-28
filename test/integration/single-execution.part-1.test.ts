@@ -202,9 +202,10 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		});
 	}
 
-	it("emits successful async workflow child settlements without provider turns", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("keeps successful children of a running async workflow out of the parent's context and wakes it for a failed one", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ matchArgIncludes: "Child A", output: "A done" });
 		mockPi.onCall({ matchArgIncludes: "Child B", output: "B done" });
+		mockPi.onCall({ matchArgIncludes: "Child C", createError: "launch failed" });
 		const sent: Array<{ message: { customType?: string; content?: string; details?: unknown }; options?: { triggerTurn?: boolean } }> = [];
 		const sendMessage = (message: unknown, options?: unknown) => {
 			sent.push({
@@ -215,23 +216,18 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		const executor = makeExecutor([makeAgent("echo")], {}, false, undefined, true, new Map(), undefined, undefined, createEventBus(), undefined, undefined, sendMessage);
 		const launch = await executor.execute("workflow-child-wakes", {
 			async: true,
-			workflowScript: `return await runs.all([{ key: "a", agent: "echo", task: "Child A" }, { key: "b", agent: "echo", task: "Child B" }]);`,
+			workflowScript: `await runs.all([{ key: "a", agent: "echo", task: "Child A" }, { key: "b", agent: "echo", task: "Child B" }]); return await runs.run("c", { agent: "echo", task: "Child C" });`,
 		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
 		assert.equal(launch.isError, undefined, launch.content[0]?.text ?? "workflow launch failed");
 
 		const childMessages = () => sent.filter(({ message }) => message.customType === "subagent-incremental-child-notify");
-		for (let attempt = 0; attempt < 250 && childMessages().length < 2; attempt++) {
+		for (let attempt = 0; attempt < 250 && !childMessages().some(({ message }) => message.content?.includes("**c**")); attempt++) {
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		}
-		assert.deepEqual(
-			childMessages().map(({ message }) => message.content?.split("\n", 1)[0]).sort(),
-			["Workflow child completed: **a**", "Workflow child completed: **b**"],
-		);
-		assert.deepEqual(
-			childMessages().map(({ message }) => message.details).sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))),
-			[{ childKey: "a", outcome: "completed" }, { childKey: "b", outcome: "completed" }],
-		);
-		assert.ok(childMessages().every(({ options }) => options?.triggerTurn === false));
+		// a and b settled before c launched, so any notice of theirs would already be here.
+		assert.deepEqual(childMessages().map(({ message }) => message.content?.split("\n", 1)[0]), ["Workflow child failed: **c**"]);
+		assert.equal(childMessages()[0]!.options?.triggerTurn, true);
+		assert.match(childMessages()[0]!.message.content ?? "", /Status: workflow still running/);
 	});
 
 	it("spawns agent and captures output", async () => {
@@ -5228,6 +5224,77 @@ Answer only from the supplied synthetic text.
 		const validation = await executor.execute("scripted-workflow-unknown-agent-validate", { action: "validate", workflowScript }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
 		assert.equal(validation.isError, true);
 		assert.deepEqual(JSON.parse(validation.content[0]?.text ?? "").errors.map((error: { kind?: string; line?: number }) => ({ kind: error.kind, line: error.line })), [{ kind: "agent", line: 2 }]);
+	});
+
+	it("rejects an unknown literal agent in a child with its own cwd before launching any workflow child", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([makeAgent("reviewer")]);
+		// The named parallel workflow writes each task's cwd onto its runs.all item; that must not hide the agent name from validation.
+		const result = await executor.executePublic(
+			"parallel-unknown-agent-own-cwd",
+			{ workflow: "parallel", args: { tasks: [{ agent: "reviwer", cwd: tempDir, task: "Review src/api" }] } },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, true);
+		assert.equal(mockPi.callCount(), 0);
+		assert.deepEqual(result.details.results, []);
+		const errors = JSON.parse(result.content[0]?.text ?? "").errors.map((error: { kind?: string; message?: string }) => ({ kind: error.kind, message: error.message }));
+		assert.deepEqual(errors.map((error) => error.kind), ["agent"]);
+		assert.match(errors[0]?.message ?? "", /runs\.all item: Unknown agent 'reviwer'\. Did you mean 'reviewer'\?/);
+	});
+
+	it("checks a child with its own cwd against the agents discovered there", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const childCwd = path.join(tempDir, "child-cwd");
+		fs.mkdirSync(childCwd, { recursive: true });
+		// 'reviewer' exists only at the child cwd; 'worker' exists only at the workflow cwd.
+		const executor = makeExecutor([], {}, false, undefined, true, new Map(), undefined, undefined, createEventBus(), (cwd) => cwd === childCwd ? [makeAgent("reviewer")] : [makeAgent("worker")]);
+		const launch = (id: string, tasks: Array<{ agent: string; task: string; cwd?: string }>) => executor.executePublic(id, { workflow: "parallel", args: { tasks }, async: false }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+
+		mockPi.onCall({ output: "Child cwd agent completed" });
+		mockPi.onCall({ output: "Workflow cwd agent completed" });
+		const placed = await launch("parallel-agent-own-cwd", [{ agent: "reviewer", cwd: childCwd, task: "Review" }, { agent: "worker", task: "Write" }]);
+		assert.equal(placed.isError, undefined, placed.content[0]?.text ?? "parallel workflow failed");
+		assert.equal(mockPi.callCount(), 2);
+
+		const misplaced = await launch("parallel-agent-own-cwd-misplaced", [{ agent: "worker", cwd: childCwd, task: "Write" }]);
+		assert.equal(misplaced.isError, true);
+		assert.equal(mockPi.callCount(), 2);
+		const errors = JSON.parse(misplaced.content[0]?.text ?? "").errors.map((error: { kind?: string; message?: string }) => ({ kind: error.kind, message: error.message }));
+		assert.deepEqual(errors.map((error) => error.kind), ["agent"]);
+		assert.match(errors[0]?.message ?? "", /runs\.all item: Unknown agent 'worker'\./);
+	});
+
+	it("checks a child with its own absolute cwd when the workflow cwd differs from the parent cwd", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const childCwd = path.join(tempDir, "project", "child-cwd");
+		fs.mkdirSync(childCwd, { recursive: true });
+		// 'reviewer' exists only at the child cwd; nothing exists at the workflow cwd or the parent cwd.
+		const executor = makeExecutor([], {}, false, undefined, true, new Map(), undefined, undefined, createEventBus(), (cwd) => cwd === childCwd ? [makeAgent("reviewer")] : []);
+		mockPi.onCall({ output: "Child cwd agent completed" });
+		const result = await executor.executePublic(
+			"parallel-agent-own-cwd-under-workflow-cwd",
+			{ workflow: "parallel", cwd: "project", args: { tasks: [{ agent: "reviewer", cwd: childCwd, task: "Review" }] }, async: false },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		assert.equal(result.isError, undefined, result.content[0]?.text ?? "parallel workflow failed");
+		assert.equal(mockPi.callCount(), 1);
+
+		// The same child with an agent that exists nowhere is rejected before launch, by name.
+		const misplaced = await executor.executePublic(
+			"parallel-unknown-agent-own-cwd-under-workflow-cwd",
+			{ workflow: "parallel", cwd: "project", args: { tasks: [{ agent: "reviwer", cwd: childCwd, task: "Review" }] }, async: false },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		assert.equal(misplaced.isError, true);
+		assert.equal(mockPi.callCount(), 1);
+		const errors = JSON.parse(misplaced.content[0]?.text ?? "").errors.map((error: { kind?: string; message?: string }) => ({ kind: error.kind, message: error.message }));
+		assert.deepEqual(errors.map((error) => error.kind), ["agent"]);
+		assert.match(errors[0]?.message ?? "", /runs\.all item: Unknown agent 'reviwer'\./);
 	});
 
 	it("checks literal agents with the parent model's provider-specific discovery", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

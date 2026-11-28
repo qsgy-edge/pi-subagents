@@ -132,7 +132,7 @@ import { handleInspectorAction, INSPECTOR_ACTIONS } from "../../inspectors/actio
 import { getInspectorPlugins } from "../../inspectors/plugins.ts";
 import { handleHerdrProjectPaneAction, HERDR_PROJECT_PANE_ACTIONS } from "../../inspectors/herdr/project-panes.ts";
 import { previewSimpleWorkflowRun, runWorkflowScript, validateWorkflowScript, WorkflowScriptError, type WorkflowLanePlan, type WorkflowReceiptResumeReference, type WorkflowScriptChildResult, type WorkflowScriptTraceEntry, type WorkflowSteerOptions, type WorkflowSteerResult } from "../../workflows/scripted-workflow.ts";
-import { formatIncrementalChildCompletion, incrementalChildCompletionTriggersTurn } from "../background/notify.ts";
+import { formatIncrementalChildCompletion, scheduledCompletionTriggersTurn } from "../background/notify.ts";
 import { COMPLETION_ACTION, STATUS_ACTION } from "../../shared/parent-wake.ts";
 import { appendWorkflowChildJournal, claimedWorkflowRunRefusal, findWorkflowReuseSource, matchWorkflowReuse, readNamedWorkflowReuseSource, WORKFLOW_RUNTIME_REPLACED_STOP_NOTICE, workflowChildFingerprint, workflowScriptDigest, workflowStopCause } from "../../workflows/workflow-reuse.ts";
 import { claimWorkflowResume, recordWorkflowResumeRefusal, releaseWorkflowResumeClaim, resumedRunStarted } from "../../workflows/workflow-resume-claim.ts";
@@ -2708,21 +2708,35 @@ function canonicalizeAgentName(name: string, agents: AgentConfig[], diagnostics:
 	return { name: resolved.agent.name };
 }
 
-// Mirrors child launch: workflow children without their own cwd/agentScope discover agents at the workflow cwd and scope.
+// Mirrors child launch: a workflow child without its own cwd/agentScope discovers agents at the workflow cwd and scope, and one with either discovers them there.
 function workflowValidationOptions(deps: ExecutorDeps, params: SubagentParamsLike, runtimeCwd: string, parentModelProvider: () => string | undefined): Parameters<typeof validateWorkflowScript>[1] {
 	const cwd = resolveRequestedCwd(runtimeCwd, params.cwd);
 	const scope = resolveExecutionAgentScope(params.agentScope);
-	let discovered: ReturnType<ExecutorDeps["discoverAgents"]> | undefined;
+	const discovered = new Map<string, ReturnType<ExecutorDeps["discoverAgents"]>>();
 	// Validation reports every bad agent name; only the first one carries the agent list.
 	let listedAgents = false;
+	const discover = (atCwd: string, atScope: AgentScope) => {
+		const key = JSON.stringify([atCwd, atScope]);
+		let found = discovered.get(key);
+		if (!found) {
+			found = deps.discoverAgents(atCwd, atScope, parentModelProvider());
+			discovered.set(key, found);
+		}
+		return found;
+	};
 	return {
 		maxSubagentSpawnsPerRun: params.maxSubagentSpawnsPerRun ?? resolveMaxSubagentSpawnsPerRun(deps.config.maxSubagentSpawnsPerRun),
-		agentNameError: (name) => {
-			discovered ??= deps.discoverAgents(cwd, scope, parentModelProvider());
-			const { agents } = discovered;
+		agentNameError: (name, child) => {
+			const childScope = child.agentScope === undefined ? scope : resolveExecutionAgentScope(child.agentScope);
+			// Mirrors resolveWorkflowChildLocalCwd: a child whose agent is a placed (machine) agent keeps the workflow cwd.
+			const childCwd = child.cwd === undefined || resolveAgentName(name, discover(cwd, childScope).agents).agent?.machine !== undefined
+				? cwd
+				: child.cwd;
+			const atChild = discover(childCwd, childScope);
+			const { agents } = atChild;
 			const resolved = resolveAgentName(name, agents);
-			if (resolved.agent || resolved.error) return canonicalizeAgentName(name, agents, discovered.agentDiagnostics, diagnosticContextFromDiscovery(discovered, cwd, scope)).error;
-			const disabled = discovered.disabledAgents?.includes(name.trim()) === true;
+			if (resolved.agent || resolved.error) return canonicalizeAgentName(name, agents, atChild.agentDiagnostics, diagnosticContextFromDiscovery(atChild, childCwd, childScope)).error;
+			const disabled = atChild.disabledAgents?.includes(name.trim()) === true;
 			const suggestion = disabled ? undefined : suggestAgentName(name, agents);
 			const problem = disabled ? `Agent '${name}' is disabled by a settings override.` : `Unknown agent '${name}'.${suggestion ? ` Did you mean '${suggestion}'?` : ""}`;
 			if (listedAgents) return problem;
@@ -6526,21 +6540,26 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 									outcome: notification.outcome,
 									workflowRunning: notification.workflowRunning,
 								});
-								try {
-									const triggerTurn = incrementalChildCompletionTriggersTurn(notification, requestParams.scheduleOrigin);
-									const content = formatIncrementalChildCompletion(notification);
-									(deps.parentWake ?? deps.pi).sendMessage(
-										{
-											customType: "subagent-incremental-child-notify",
-											content: triggerTurn ? `${content}\n\nParent action: ${COMPLETION_ACTION}` : content,
-											display: notification.outcome !== "completed",
-											// Render-only: Pi does not send details to the model.
-											details: { childKey: notification.childKey, outcome: notification.outcome },
-										},
-										{ triggerTurn },
-									);
-								} catch (sendError) {
-									console.error(`Failed to send incremental child completion notification for '${notification.childKey}':`, sendError);
+								// A successful child of a running workflow needs no decision: status and the workflow's final notice carry it.
+								// One model-visible message per child grows the parent's context, and a burst of them moves the cache
+								// breakpoint past the provider's lookback, so the next request misses the cache (#3392).
+								if (notification.outcome !== "completed" || !notification.workflowRunning) {
+									try {
+										const triggerTurn = scheduledCompletionTriggersTurn(requestParams.scheduleOrigin, notification.outcome);
+										const content = formatIncrementalChildCompletion(notification);
+										(deps.parentWake ?? deps.pi).sendMessage(
+											{
+												customType: "subagent-incremental-child-notify",
+												content: triggerTurn ? `${content}\n\nParent action: ${COMPLETION_ACTION}` : content,
+												display: notification.outcome !== "completed",
+												// Render-only: Pi does not send details to the model.
+												details: { childKey: notification.childKey, outcome: notification.outcome },
+											},
+											{ triggerTurn },
+										);
+									} catch (sendError) {
+										console.error(`Failed to send incremental child completion notification for '${notification.childKey}':`, sendError);
+									}
 								}
 								deps.refreshResultDelivery?.();
 							},
@@ -7465,7 +7484,8 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				const hasDirectoryTarget = Boolean(paramsWithResolvedCwd.dir);
 				const targetLabel = action === "debug.run" ? "Debug run" : formatStatusTargetLabel(paramsWithResolvedCwd, targetRunId);
 				const withBudget = (result: AgentToolResult<Details>) => {
-					const budgeted = withSpawnBudgetStatus(result, deps.state, deps.config, deps.state.currentSessionId);
+					// An error is not a status payload.
+					const budgeted = result.isError ? result : withSpawnBudgetStatus(result, deps.state, deps.config, deps.state.currentSessionId);
 					return {
 						...budgeted,
 						content: budgeted.content.map((item, index) => index === 0 && item.type === "text"
@@ -7473,15 +7493,16 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 							: item),
 					};
 				};
+				const nestedScope = nestedResolutionScopeForExecutor(deps);
 				const withChildQuestions = async (result: AgentToolResult<Details>): Promise<AgentToolResult<Details>> => {
 					if (!deps.runSupervisorAction) return result;
 					const pending = await deps.runSupervisorAction({ action: "pending" });
 					if (!pending.details.pending?.some((request) => request.expectsReply)) return result;
 					const questions = { type: "text" as const, text: `Child questions waiting for an answer (subagent({action:"reply", replyTo, message})):\n${pending.content.flatMap((item) => item.type === "text" ? [item.text] : []).join("\n")}` };
-					if (result.isError) return { content: [questions], details: result.details };
+					// A child-safe caller without a foreground run can read its questions, but cannot list runs without an id.
+					if (result.isError && nestedScope && !paramsWithResolvedCwd.view) return { content: [questions], details: result.details };
 					return { ...result, content: [...result.content, questions] };
 				};
-				const nestedScope = nestedResolutionScopeForExecutor(deps);
 				const sessionRoots = trustedSessionRoots(ctx.sessionManager.getSessionFile() ?? null, deps);
 				if (action === "debug.run") {
 					if (!targetRunId && !hasDirectoryTarget) {

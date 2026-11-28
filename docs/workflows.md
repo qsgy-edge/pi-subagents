@@ -18,7 +18,6 @@ A background child awaited by an `async: false` workflow cannot receive a superv
 
 Child-safety boundaries are enforced at runtime:
 
-- Fresh (non-fork) child sessions never receive a skill named `pi-subagents`; a fork keeps the parent's prompt, skills included.
 - Child context filtering removes parent-only subagent artifacts (hidden orchestration-instruction messages, slash/status/control messages, and `subagent` tool-call/tool-result history) while preserving ordinary prose and unrelated tool calls/results. A forked child sends the history it inherited exactly as the parent sent it, so its first request can reuse the parent's prompt cache; it still cannot run `subagent`.
 - By default, a child's `subagent` tool can only wait for its own background work, and the child receives boundary instructions that it is not the parent orchestrator and must not propose or run subagents.
 - The explicit exception is an agent whose resolved builtin `tools` includes `subagent`; that child gets a child-safe `subagent` tool for the fanout work the parent assigned, still bounded by `maxSubagentDepth`.
@@ -60,6 +59,8 @@ When a session with a UI has queued or running async work, live nested children,
 - **Switch and leave the work here**: the new session inherits nothing from this one. Async single, parallel, and chain runs keep running under this session; reopen it to get their results. Async workflows and detached foreground runs stop on any switch; a stopped workflow resumes automatically only if you reopen this session within 24 hours. A child's question can be answered only until it times out (10 minutes by default).
 
 Without outstanding work, or without a UI (`pi -p`, SDK sessions), there is no prompt and the new session takes the work over. Over RPC the prompt is a select dialog that counts as **Stay here** if the host does not answer within one minute. The prompt never enters model history.
+
+In a TUI the prompt waits for a keypress, so a switch nobody answers, such as a `/new` an agent starts while you are away, waits until someone does; [`sessionSwitch`](configuration.md#sessionswitch) bounds it and picks the answer.
 
 ## Prompt shortcuts
 
@@ -193,7 +194,7 @@ These controls are opt-in. Avoid tight hard budgets for mutation-capable workers
 
 The optional `preflight` lane hints apply only to raw scripts (`workflow: true` or a script path), not named workflows or direct child calls. They are display-only: mismatched coverage warns but never changes execution authority.
 
-The result is `{ ok, errors }`. Invalid scripts return a tool error and include line and column data when available. Validation checks syntax, portable nested-async rules, literal `runs.run` and `runs.all` keys and child `baseRef` values, duplicate literal keys in one `runs.all` group, direct keyed access to a known `runs.all` result, and statically clear non-JSON boundary values. It also looks up literal `agent` names in `runs.run`, `runs.all`, and `runs.lanes` children against the agents discovered for the request `cwd` and `agentScope`, and reports unknown or ambiguous names with a close match when one exists. Children with their own `cwd`, `agentScope`, or `resume`, object spreads, and names built at runtime are left to launch time. Dynamic keys and other runtime-only values are accepted without a warning. Validation does not launch children or create run artifacts. Executing a workflow runs the same agent-name check first, so an unknown literal agent fails before any child launches.
+The result is `{ ok, errors }`. Invalid scripts return a tool error and include line and column data when available. Validation checks syntax, portable nested-async rules, literal `runs.run` and `runs.all` keys and child `baseRef` values, duplicate literal keys in one `runs.all` group, direct keyed access to a known `runs.all` result, and statically clear non-JSON boundary values. It also looks up literal `agent` names in `runs.run`, `runs.all`, and `runs.lanes` children against the agents discovered where launch resolves them: the request `cwd` and `agentScope`, or the child's own literal absolute `cwd` and `agentScope` when it has either (a child with `machine` keeps the workflow `cwd`), and reports unknown or ambiguous names with a close match when one exists. Children with `resume`, a relative `cwd`, object spreads, and names, `cwd` or `agentScope` values built at runtime are left to launch time. Dynamic keys and other runtime-only values are accepted without a warning. Validation does not launch children or create run artifacts. Executing a workflow runs the same agent-name check first, so an unknown literal agent fails before any child launches.
 
 ```js workflow
 const scan = await runs.run("scan", { label: "Map codebase behavior", agent: "scout", task: "Scan the codebase" });
